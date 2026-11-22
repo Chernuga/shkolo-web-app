@@ -62,6 +62,14 @@ class MainActivity : AppCompatActivity() {
     /** Guards the one-shot credential reset on the logout redirect. */
     private var logoutHandled = false
 
+    /**
+     * Last main-frame URL, updated on the UI thread.
+     * The JS bridge runs on the JavaBridge thread, where any WebView
+     * call (even reading webView.url) throws, so the origin check has
+     * to read this instead.
+     */
+    @Volatile private var pageUrl: String? = null
+
     /** True only when the user clicked a logout link themselves. */
     private var pendingUserLogout = false
 
@@ -118,6 +126,7 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest
             ): Boolean {
                 val uri = request.url
+                if (request.isForMainFrame) pageUrl = uri.toString()
                 if (isLogoutUrl(uri.toString())) onLogoutDetected()
                 val host = uri.host ?: return false
 
@@ -137,7 +146,12 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
+            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                pageUrl = url
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
+                pageUrl = url
                 if (isLogoutUrl(url)) onLogoutDetected()
                 swipe.isRefreshing = false
                 progress.visibility = View.GONE
@@ -290,7 +304,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Only the real Shkolo origin may touch the credential bridge. */
     private fun trustedOrigin(): Boolean {
-        val u = webView.url ?: return false
+        val u = pageUrl ?: return false
         return u.startsWith("https://app.shkolo.bg") ||
             u.startsWith("https://shkolo.bg") ||
             u.startsWith("https://www.shkolo.bg")
@@ -309,7 +323,7 @@ class MainActivity : AppCompatActivity() {
         fun load(): String? {
             if (!trustedOrigin()) return null
             val now = System.currentTimeMillis()
-            if (now - lastAutoFillAt < 10_000L) return null
+            if (now - lastAutoFillAt < 10_000L) return ""   // throttled, not missing
             val c = CredStore.load(this@MainActivity) ?: return null
             lastAutoFillAt = now
             return c.first + "\n" + c.second
@@ -507,6 +521,7 @@ private const val JS_LOGIN_HELPER = """
   var f = fields();
   if (!f.p || f.p.value) return;          // not the login form, or already filled
   var raw = ShkoloBridge.load();
+  if (raw === '') { ShkoloBridge.log('autofill throttled, ignoring this load'); return; }
   if (!raw) { ShkoloBridge.log('no saved credentials - waiting for manual login'); return; }
   ShkoloBridge.log('saved credentials found, waiting for fingerprint');
   var nl = raw.indexOf('\n');
