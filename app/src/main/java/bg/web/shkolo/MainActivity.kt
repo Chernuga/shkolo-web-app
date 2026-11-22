@@ -62,6 +62,9 @@ class MainActivity : AppCompatActivity() {
     /** Guards the one-shot credential reset on the logout redirect. */
     private var logoutHandled = false
 
+    /** True only when the user clicked a logout link themselves. */
+    private var pendingUserLogout = false
+
     // ----- file chooser plumbing -----
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private var cameraImageUri: Uri? = null
@@ -248,7 +251,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        swipe.setOnRefreshListener { webView.reload() }
+        // Reload is disabled on purpose: a stray pull used to reload the page
+        // and could drop an in-flight login or land on a fresh session page.
+        swipe.setOnRefreshListener { swipe.isRefreshing = false }
+        swipe.isEnabled = false
         swipe.setColorSchemeColors(0xFF1E88E5.toInt())
 
         requestBasePermissions()
@@ -310,6 +316,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun userLogout() {
+            if (!trustedOrigin()) return
+            pendingUserLogout = true
+            Log.i(TAG, "user clicked a logout link")
+        }
+
+        @JavascriptInterface
         fun log(msg: String?) {
             Log.i(TAG, "js: " + msg)
         }
@@ -328,8 +341,16 @@ class MainActivity : AppCompatActivity() {
     private fun onLogoutDetected() {
         if (!logoutHandled) {
             logoutHandled = true
-            CredStore.clear(this)
-            lastAutoFillAt = 0L
+            if (pendingUserLogout) {
+                CredStore.clear(this)
+                lastAutoFillAt = 0L
+                Log.i(TAG, "logout (user initiated): credentials cleared")
+            } else {
+                // Session timeout also redirects here. Do not throw away the
+                // saved login, or the next launch cannot re-authenticate.
+                Log.i(TAG, "reached /auth/logout without a click - keeping credentials")
+            }
+            pendingUserLogout = false
         }
         // Let the site finish its own logout before dropping the local session.
         webView.postDelayed({
@@ -470,6 +491,13 @@ private const val JS_LOGIN_HELPER = """
     if (!f.u || !f.p || !f.u.value || !f.p.value) return;
     ShkoloBridge.save(f.u.value, f.p.value);
   }
+  // A click on a logout link is the only thing that should wipe credentials.
+  document.addEventListener('click', function(e){
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest('a[href*="/auth/logout"]')) ShkoloBridge.userLogout();
+  }, true);
+
   document.addEventListener('submit', grab, true);
   document.addEventListener('click', function(e){
     var t = e.target; if (!t) return;
@@ -479,7 +507,8 @@ private const val JS_LOGIN_HELPER = """
   var f = fields();
   if (!f.p || f.p.value) return;          // not the login form, or already filled
   var raw = ShkoloBridge.load();
-  if (!raw) return;
+  if (!raw) { ShkoloBridge.log('no saved credentials - waiting for manual login'); return; }
+  ShkoloBridge.log('saved credentials found, waiting for fingerprint');
   var nl = raw.indexOf('\n');
   if (nl <= 0) return;
   var user = raw.substring(0, nl);
@@ -502,7 +531,7 @@ private const val JS_LOGIN_HELPER = """
       g.form.submit();
     } else if (tries > 30) {
       clearInterval(timer);
-      ShkoloBridge.log('fingerprint not ready: ' + st);
+      ShkoloBridge.log('fingerprint never became ready: ' + st);
     }
   }, 500);
 })();
